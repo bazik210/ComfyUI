@@ -25,6 +25,7 @@ import comfy.sample
 import comfy.sd
 import comfy.utils
 import comfy.controlnet
+from comfy.cli_args import args
 from comfy.comfy_types import IO, ComfyNodeABC, InputTypeDict, FileLocator
 
 from fast_sampler import fast_vae_decode
@@ -41,6 +42,8 @@ import importlib
 import folder_paths
 import latent_preview
 import node_helpers
+
+DEBUG_ENABLED = args.debug
 
 def before_node_execution():
     comfy.model_management.throw_exception_if_processing_interrupted()
@@ -280,7 +283,13 @@ class VAEDecode:
         return {
             "required": {
                 "samples": ("LATENT", {"tooltip": "The latent to be decoded."}),
-                "vae": ("VAE", {"tooltip": "The VAE model used for decoding the latent."})
+                "vae": ("VAE", {"tooltip": "The VAE model used for decoding the latent."}),
+            },
+            "optional": {
+                "tile_size": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 32, "tooltip": "Tile size for tiled decoding."}),
+                "overlap": ("INT", {"default": 64, "min": 0, "max": 256, "step": 16, "tooltip": "Overlap between tiles for smooth blending."}),
+                "precision": (["auto", "fp16", "fp32"], {"default": "auto", "tooltip": "Precision for decoding: auto (float32), fp16 (faster, less VRAM), fp32 (more accurate)."}),
+                "use_tiled": ("BOOLEAN", {"default": False, "tooltip": "Enable tiled decoding for large images or low VRAM."}),
             }
         }
     RETURN_TYPES = ("IMAGE",)
@@ -289,8 +298,9 @@ class VAEDecode:
     CATEGORY = "latent"
     DESCRIPTION = "Decodes latent images back into pixel space images."
 
-    def decode(self, vae, samples):
-        return fast_vae_decode(vae, samples)
+    def decode(self, vae, samples, tile_size=512, overlap=64, precision="auto", use_tiled=False):
+        # Call fast_vae_decode with all parameters
+        return fast_vae_decode(vae, samples, tile_size=tile_size, overlap=overlap, precision=precision, use_tiled=use_tiled)
 
 class VAEDecodeTiled:
     @classmethod
@@ -299,8 +309,11 @@ class VAEDecodeTiled:
             "required": {
                 "samples": ("LATENT", {"tooltip": "The latent to be decoded."}),
                 "vae": ("VAE", {"tooltip": "The VAE model used for decoding the latent."}),
-                "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 32, "tooltip": "Tile size for tiled decoding."}),
-                "overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32, "tooltip": "Tile overlap for tiled decoding."}),
+                "tile_size": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 32, "tooltip": "Tile size for tiled decoding."}),
+                "overlap": ("INT", {"default": 64, "min": 0, "max": 256, "step": 16, "tooltip": "Overlap between tiles for smooth blending."}),
+            },
+            "optional": {
+                "precision": (["auto", "fp16", "fp32"], {"default": "auto", "tooltip": "Precision for decoding: auto (float32), fp16 (faster, less VRAM), fp32 (more accurate)."}),
                 "temporal_size": ("INT", {"default": 64, "min": 8, "max": 4096, "step": 4, "tooltip": "Only used for video VAEs: Amount of frames to decode at a time."}),
                 "temporal_overlap": ("INT", {"default": 8, "min": 4, "max": 4096, "step": 4, "tooltip": "Only used for video VAEs: Amount of frames to overlap."}),
             }
@@ -311,9 +324,11 @@ class VAEDecodeTiled:
     CATEGORY = "_for_testing"
     DESCRIPTION = "Decodes latent images back into pixel space images using tiled decoding for VRAM efficiency."
 
-    def decode(self, vae, samples, tile_size=512, overlap=64, temporal_size=64, temporal_overlap=8):
-        return fast_vae_tiled_decode(vae, samples, tile_size=tile_size, overlap=overlap,
+    def decode(self, vae, samples, tile_size=512, overlap=64, precision="auto", temporal_size=64, temporal_overlap=8):
+        # Call fast_vae_tiled_decode with all parameters
+        return fast_vae_tiled_decode(vae, samples, tile_size=tile_size, overlap=overlap, precision=precision,
                                      temporal_size=temporal_size, temporal_overlap=temporal_overlap)
+                                     
 class VAEEncode:
     @classmethod
     def INPUT_TYPES(s):
@@ -833,37 +848,79 @@ class ControlNetApply:
 class ControlNetApplyAdvanced:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"positive": ("CONDITIONING", ),
-                             "negative": ("CONDITIONING", ),
-                             "control_net": ("CONTROL_NET", ),
-                             "image": ("IMAGE", ),
-                             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-                             "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
-                             "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001})
+        return {
+            "required": {
+                "positive": ("CONDITIONING", {"tooltip": "Positive conditioning to guide the image generation."}),
+                "negative": ("CONDITIONING", {"tooltip": "Negative conditioning to exclude unwanted attributes."}),
+                "control_net": ("CONTROL_NET", {"tooltip": "The ControlNet model to apply structural guidance."}),
+                "image": ("IMAGE", {"tooltip": "Input image used as a control hint for the ControlNet."}),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "Strength of the ControlNet influence. Higher values increase adherence to the control image."}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Percentage of steps where ControlNet starts to apply."}),
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Percentage of steps where ControlNet stops applying."}),
+                "downscale_input": ("BOOLEAN", {"default": False, "tooltip": "If enabled, resizes the input image to match expected_width and expected_height."}),
+                "precision": (["auto", "fp16", "fp32"], {"default": "auto", "tooltip": "Precision for control hint: auto (float32), fp16 (faster, less VRAM), fp32 (more accurate)."}),
                              },
-                "optional": {"vae": ("VAE", ),
+            "optional": {
+                "vae": ("VAE", {"tooltip": "Optional VAE for additional conditioning, if required by the ControlNet."}),
+                "expected_width": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 64, "tooltip": "Expected width of the control image. If downscale_input is enabled, the input image is resized to this width."}),
+                "expected_height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 64, "tooltip": "Expected height of the control image. If downscale_input is enabled, the input image is resized to this height."}),
                              }
     }
 
-    RETURN_TYPES = ("CONDITIONING","CONDITIONING")
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING")
     RETURN_NAMES = ("positive", "negative")
+    OUTPUT_TOOLTIPS = ("Modified positive conditioning.", "Modified negative conditioning.")
     FUNCTION = "apply_controlnet"
 
     CATEGORY = "conditioning/controlnet"
+    DESCRIPTION = "Applies a ControlNet model to guide image generation using an input image."
 
-    def apply_controlnet(self, positive, negative, control_net, image, strength, start_percent, end_percent, vae=None, extra_concat=[]):
+    def apply_controlnet(self, positive, negative, control_net, image, strength, start_percent, end_percent, downscale_input=False, precision="auto", vae=None, expected_width=512, expected_height=512, extra_concat=[]):
+        """
+        Apply ControlNet to positive and negative conditioning with optional downscaling and precision control.
+        """
         if strength == 0:
             return (positive, negative)
 
-        control_hint = image.movedim(-1,1)
-        cnets = {}
+        if DEBUG_ENABLED:
+            logging.debug(f"ControlNetApplyAdvanced: Input image shape: {image.shape}")
 
+        control_hint = image.movedim(-1, 1)
+        if DEBUG_ENABLED:
+            logging.debug(f"ControlNetApplyAdvanced: Control hint shape after movedim: {control_hint.shape}")
+
+        # Determine dtype
+        if precision == "fp16" and is_fp16_safe(comfy.model_management.intermediate_device()):
+            dtype = torch.float16
+        elif precision == "fp32":
+            dtype = torch.float32
+        else:  # auto
+            dtype = torch.float32  # Default to float32 for stability
+
+        # Move to device and apply dtype
+        control_hint = control_hint.to(device=comfy.model_management.intermediate_device(), dtype=dtype)
+
+        # Resize if needed
+        if downscale_input:
+            if control_hint.shape[-2] != expected_height or control_hint.shape[-1] != expected_width:
+                control_hint = torch.nn.functional.interpolate(
+                    control_hint,
+                    size=(expected_height, expected_width),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                if DEBUG_ENABLED:
+                    logging.debug(f"ControlNetApplyAdvanced: Resized control hint to: {control_hint.shape}")
+
+        if DEBUG_ENABLED:
+            logging.debug(f"ControlNetApplyAdvanced: Control hint dtype: {control_hint.dtype}")
+
+        cnets = {}
         out = []
         for conditioning in [positive, negative]:
             c = []
             for t in conditioning:
                 d = t[1].copy()
-
                 prev_cnet = d.get('control', None)
                 if prev_cnet in cnets:
                     c_net = cnets[prev_cnet]
@@ -871,14 +928,16 @@ class ControlNetApplyAdvanced:
                     c_net = control_net.copy().set_cond_hint(control_hint, strength, (start_percent, end_percent), vae=vae, extra_concat=extra_concat)
                     c_net.set_previous_controlnet(prev_cnet)
                     cnets[prev_cnet] = c_net
-
                 d['control'] = c_net
                 d['control_apply_to_uncond'] = False
                 n = [t[0], d]
                 c.append(n)
             out.append(c)
-        return (out[0], out[1])
 
+        if DEBUG_ENABLED:
+            logging.debug(f"ControlNetApplyAdvanced: Positive conditioning: {len(out[0])}, Negative conditioning: {len(out[1])}")
+        
+        return (out[0], out[1])
 
 class UNETLoader:
     @classmethod
