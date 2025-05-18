@@ -90,11 +90,14 @@ def clear_vram(device, threshold=0.5, min_free=1.5):
     elif device.type == 'privateuseone':
         # For DirectML just clearing cache, cause mem_get_info not working
         if PROFILING_ENABLED:
+            start_time = time.time()
             logging.debug("Clearing VRAM for DirectML (mem_get_info unavailable)")
         torch.cuda.empty_cache()
+        if PROFILING_ENABLED:
+            logging.debug(f"VRAM clear for DirectML took {time.time() - start_time:.3f} s")
         return 0, 0
     return 0, 0
-
+    
 def preload_model(model, device, is_vae=False):
     """Preload model or VAE to device, avoiding unnecessary unloading."""
     with profile_section("Model preload"):
@@ -121,6 +124,7 @@ def preload_model(model, device, is_vae=False):
             model._loaded_to_device = device
             if PROFILING_ENABLED:
                 logging.debug(f"VAE transferred to {device}, took {time.time() - transfer_start:.3f} s")
+                logging.debug(f"VAE preload took {time.time() - start_time:.3f} s")
                 logging.debug(f"VAE first_stage_model device: {model.first_stage_model.device}")
                 logging.debug(f"VAE has decode_tiled: {hasattr(model, 'decode_tiled')}")
         else:
@@ -206,7 +210,8 @@ def fast_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, ne
     """
     if DEBUG_ENABLED:
         if model is None:
-            logging.warning("fast_ksampler: model is None")
+            logging.error("fast_ksampler: model is None")
+            raise ValueError("Model cannot be None")
         logging.debug(f"Starting fast_ksampler, device={device}, is_gpu={is_gpu}")
     if device is None or dtype is None or is_gpu is None:
         device, dtype, is_gpu = initialize_device_and_dtype(model.model)
@@ -317,51 +322,80 @@ def fast_ksampler(model, seed, steps, cfg, sampler_name, scheduler, positive, ne
     finally:
         if PROFILING_ENABLED:
             finally_start = time.time()
+            logging.debug(f"Final cleanup took {time.time() - finally_start:.3f} s")
         if is_gpu and CUDNN_BENCHMARK_ENABLED:
             torch.backends.cudnn.benchmark = False
-        if PROFILING_ENABLED:
-            logging.debug(f"Final cleanup took {time.time() - finally_start:.3f} s")
-
-def fast_vae_decode(vae, samples):
+        
+def fast_vae_decode(vae, samples, tile_size=512, overlap=64, precision="auto", use_tiled=False):
     """
     Fast VAE decoding with FP16, channels_last, universal VRAM management, and full logging.
+    Supports precision, tiled decoding, and tile parameters.
     """
     device = get_torch_device()
-    vae_dtype_val = vae_dtype(device=device)
     is_gpu = (device.type == 'cuda' and torch.cuda.is_available()) or (device.type == 'privateuseone')
+
+    # Determine dtype based on precision
+    if precision == "fp16" and is_fp16_safe(device):
+        vae_dtype_val = torch.float16
+    elif precision == "fp32":
+        vae_dtype_val = torch.float32
+    else:  # auto
+        vae_dtype_val = vae_dtype(device=device)
 
     if DEBUG_ENABLED:
         logging.debug(f"VAE dtype: {vae_dtype_val}")
         logging.debug(f"Pre-VAE checkpoint: {time.time()}")
         logging.debug(f"Starting fast_vae_decode, device={device}, dtype={vae_dtype_val}, is_gpu={is_gpu}")
-        logging.debug(f"Latent samples shape: {samples['samples'].shape}")
+        logging.debug(f"Latent samples shape: {samples['samples'].shape}, tile_size={tile_size}, overlap={overlap}, precision={precision}, use_tiled={use_tiled}")
 
     try:
         # Disable cuDNN benchmark for VAE stability if enabled
         if is_gpu and comfy.model_management.is_device_cuda(device) and CUDNN_BENCHMARK_ENABLED:
             torch.backends.cudnn.benchmark = False
 
-        # Prepare VRAM for VAE
-        if is_gpu:
-            if device.type == 'cuda':
-                mem_total = torch.cuda.get_device_properties(device).total_memory / 1024**3
-                latent_size = samples["samples"].shape
-                model_for_memory = getattr(vae, 'first_stage_model', vae)
-                vae_memory_required = estimate_vae_decode_memory(model_for_memory, latent_size, vae_dtype_val) / 1024**3
-                vram_threshold = 1.0 if mem_total < 5.9 else 1.1
-                vae_memory_required *= vram_threshold
+        # Check VRAM and image size to decide on tiled decoding
+        height, width = samples["samples"].shape[-2] * 8, samples["samples"].shape[-1] * 8
+        vram_check_needed = is_gpu and device.type == 'cuda'
+        available_vram = (torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_allocated(device)) / 1024**3 if vram_check_needed else float('inf')
+        
+        # Enable tiled decoding if explicitly requested, or if image is large, or VRAM is low
+        if use_tiled or (height > 512 or width > 512 or (vram_check_needed and available_vram < 2.0)):
+            if PROFILING_ENABLED:
+                logging.debug(f"Switching to tiled decoding: height={height}, width={width}, available_vram={available_vram:.2f} GB, use_tiled={use_tiled}")
+            return fast_vae_tiled_decode(vae, samples, tile_size=tile_size, overlap=overlap, precision=precision,
+                                         temporal_size=64, temporal_overlap=8)  # Default values for temporal parameters
+
+        # Estimate VAE memory requirements
+        if vram_check_needed:
+            mem_total = torch.cuda.get_device_properties(device).total_memory / 1024**3
+            mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
+            free_mem = mem_total - mem_allocated
+            latent_size = samples["samples"].shape
+            model_for_memory = getattr(vae, 'first_stage_model', vae)
+            vae_memory_required = estimate_vae_decode_memory(model_for_memory, latent_size, vae_dtype_val) / 1024**3
+            vram_threshold = 1.0 if mem_total < 5.9 else 1.1
+            vae_memory_required *= vram_threshold
+            if PROFILING_ENABLED:
+                logging.debug(f"Estimated VAE memory: {vae_memory_required:.2f} GB")
+                logging.debug(f"VRAM before decode: {mem_allocated:.2f} GB / {mem_total:.2f} GB")
+            if (hasattr(vae, '_loaded_to_device') and vae._loaded_to_device == device and
+                free_mem >= vae_memory_required * vram_threshold):
                 if PROFILING_ENABLED:
-                    logging.debug(f"Estimated VAE memory: {vae_memory_required:.2f} GB")
-                    mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
-                    free_mem = mem_total - mem_allocated
-                if free_mem < vae_memory_required:
-                    #free_memory(vae_memory_required)
-                    mem_allocated, mem_total = clear_vram(device, threshold=0.4, min_free=2.0)
+                    logging.debug(f"VAE already loaded, sufficient memory: {free_mem:.2f} GB")
+            elif mem_total - mem_allocated < vae_memory_required:
+                if PROFILING_ENABLED:
+                    logging.debug(f"Clearing VRAM: {mem_allocated:.2f} GB used of {mem_total:.2f} GB")
+                mem_allocated, mem_total = clear_vram(device, threshold=0.4, min_free=2.0)
+                if PROFILING_ENABLED and device.type == 'cuda':
+                    logging.debug(f"VRAM after free_memory: {mem_allocated:.2f} GB / {mem_total:.2f} GB")
+                elif device.type == 'privateuseone':
                     if PROFILING_ENABLED:
-                        logging.debug(f"VRAM after free_memory: {mem_allocated:.2f} GB / {mem_total:.2f} GB")
-            elif device.type == 'privateuseone':
-                if PROFILING_ENABLED:
-                    logging.debug("Memory info unavailable for DirectML, skipping VRAM check")      
+                        logging.debug("Memory info unavailable for DirectML, clearing VRAM")
+                    if not (hasattr(vae, '_loaded_to_device') and vae._loaded_to_device == device):
+                        clear_vram(device, threshold=0.4, min_free=0.75)
+                    else:
+                        if PROFILING_ENABLED:
+                            logging.debug("VAE already loaded on DirectML, skipping VRAM cleanup")
 
         # Preload VAE to device
         preload_model(vae, device, is_vae=True)
@@ -382,37 +416,60 @@ def fast_vae_decode(vae, samples):
 
         # Decode latents
         with torch.no_grad():
-            use_amp = is_gpu and is_fp16_safe(device)
+            use_amp = is_gpu and is_fp16_safe(device) and precision in ["fp16", "auto"]
             with autocast(device_type='cuda', enabled=use_amp, dtype=torch.float16 if use_amp else torch.float32):
                 if PROFILING_ENABLED:
-                    logging.debug(f"Decoding VAE, use_amp={use_amp}")
+                    logging.debug(f"Decoding VAE, use_amp={use_amp}, dtype={'torch.float16' if use_amp else 'torch.float32'}")
                 decode_start = time.time()
                 images = vae.decode(latent_samples).clamp(0, 1)
                 if PROFILING_ENABLED:
                     logging.debug(f"VAE decode took {time.time() - decode_start:.3f} s")
                 images = finalize_images(images, device)
 
+        if is_gpu and PROFILING_ENABLED:
+            if device.type == 'cuda':
+                mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
+                mem_total = torch.cuda.get_device_properties(device).total_memory / 1024**3
+                logging.debug(f"VRAM after decoding: {mem_allocated:.2f} GB / {mem_total:.2f} GB")
+            else:
+                logging.debug("VRAM after decoding: unavailable for DirectML")
+
         return (images,)
 
     except Exception as e:
-        if PROFILING_ENABLED:
-            logging.error(f"VAE decode failed: {e}\n{traceback.format_exc()}")
+        if "out of memory" in str(e).lower() and not use_tiled:
+            logging.warning("VRAM overflow in fast_vae_decode. Retrying with tiled decoding.")
+            return fast_vae_tiled_decode(vae, samples, tile_size=tile_size, overlap=overlap, precision=precision,
+                                         temporal_size=64, temporal_overlap=8)  # Default values for temporal parameters
+        logging.error(f"VAE decode failed: {e}\n{traceback.format_exc()}")
         raise
     finally:
+        if is_gpu:
+            torch.cuda.empty_cache()
         if PROFILING_ENABLED:
             finally_start = time.time()
-        if PROFILING_ENABLED:
             logging.debug(f"Final cleanup took {time.time() - finally_start:.3f} s")
 
-def fast_vae_tiled_decode(vae, samples, tile_size=512, overlap=64, temporal_size=64, temporal_overlap=8):
-    """Fast VAE decoding with tiling for low VRAM, consistent with fast_vae_decode."""
-    device, dtype, is_gpu = initialize_device_and_dtype(vae)
-    vae_dtype_val = vae_dtype(device=device)
+def fast_vae_tiled_decode(vae, samples, tile_size=512, overlap=64, precision="auto", temporal_size=64, temporal_overlap=8):
+    """
+    Fast VAE decoding with tiling for low VRAM, consistent with fast_vae_decode.
+    Supports precision and tile parameters, including temporal tiling for video VAEs.
+    """
+    device, _, is_gpu = initialize_device_and_dtype(vae)
+    
+    # Determine dtype based on precision
+    if precision == "fp16" and is_fp16_safe(device):
+        vae_dtype_val = torch.float16
+    elif precision == "fp32":
+        vae_dtype_val = torch.float32
+    else:  # auto
+        vae_dtype_val = vae_dtype(device=device)
+
     if DEBUG_ENABLED:
         logging.debug(f"VAE dtype: {vae_dtype_val}")
         logging.debug(f"Pre-VAE checkpoint: {time.time()}")
         logging.debug(f"Starting fast_vae_tiled_decode, device={device}, dtype={vae_dtype_val}, is_gpu={is_gpu}")
-        logging.debug(f"Latent samples shape: {samples['samples'].shape}, tile_size={tile_size}, overlap={overlap}")
+        logging.debug(f"Latent samples shape: {samples['samples'].shape}, tile_size={tile_size}, overlap={overlap}, precision={precision}, temporal_size={temporal_size}, temporal_overlap={temporal_overlap}")
 
     try:
         # Disable cuDNN benchmark for tiled decoding stability if enabled
@@ -425,47 +482,35 @@ def fast_vae_tiled_decode(vae, samples, tile_size=512, overlap=64, temporal_size
                 mem_total = torch.cuda.get_device_properties(device).total_memory / 1024**3
                 mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
                 free_mem = mem_total - mem_allocated
-            elif device.type == 'privateuseone':
+            else:  # DirectML
+                mem_total = mem_allocated = free_mem = 0  # No VRAM info for DirectML
                 if PROFILING_ENABLED:
-                    logging.debug("Memory info unavailable for DirectML, skipping VRAM check")
-                    
+                    logging.debug("Memory info unavailable for DirectML")
             # Estimate memory for tiled decoding (conservative, ~50% of full decode)
             vae_memory_required = (vae.memory_used_decode(samples["samples"].shape, vae_dtype_val) / 1024**3 * 0.5
                                   if hasattr(vae, 'memory_used_decode') else 0.75)
             if PROFILING_ENABLED:
                 if device.type == 'cuda':
                     logging.debug(f"VRAM before tiled VAE: {mem_allocated:.2f} GB / {mem_total:.2f} GB")
-                else:
-                    logging.debug("VRAM before tiled VAE: unavailable for DirectML")
                 logging.debug(f"Estimated tiled VAE memory: {vae_memory_required:.2f} GB")
-
             # Skip VRAM cleanup if VAE is already loaded and memory is sufficient
-            if device.type == 'cuda':
-                if (hasattr(vae, '_loaded_to_device') and vae._loaded_to_device == device and
-                    free_mem >= vae_memory_required * 1.1):
-                    if PROFILING_ENABLED:
-                        logging.debug(f"VAE already loaded, sufficient memory: {free_mem:.2f} GB")
-                elif mem_allocated > 0.4 * mem_total or free_mem < vae_memory_required:
-                    if PROFILING_ENABLED:
-                        logging.debug(f"Clearing VRAM: {mem_allocated:.2f} GB used of {mem_total:.2f} GB")
-                    mem_allocated, mem_total = clear_vram(device, threshold=0.4, min_free=0.75)
+            if device.type == 'cuda' and (hasattr(vae, '_loaded_to_device') and vae._loaded_to_device == device and
+                                          free_mem >= vae_memory_required * 1.1):
+                if PROFILING_ENABLED:
+                    logging.debug(f"VAE already loaded, sufficient memory: {free_mem:.2f} GB")
+            elif device.type == 'privateuseone' and (hasattr(vae, '_loaded_to_device') and vae._loaded_to_device == device):
+                if PROFILING_ENABLED:
+                    logging.debug("VAE already loaded on DirectML, skipping VRAM cleanup")
             else:
-                if (hasattr(vae, '_loaded_to_device') and vae._loaded_to_device == device):
-                    if PROFILING_ENABLED:
-                        logging.debug("VAE already loaded on DirectML, skipping VRAM cleanup")
-                else:
-                    if PROFILING_ENABLED:
-                        logging.debug("Clearing VRAM for DirectML")
+                if PROFILING_ENABLED:
+                    logging.debug(f"Clearing VRAM for {'CUDA' if device.type == 'cuda' else 'DirectML'}")
+                if device.type == 'cuda':
+                    mem_allocated, mem_total = clear_vram(device, threshold=0.4, min_free=0.75)
+                else:  # DirectML
                     clear_vram(device, threshold=0.4, min_free=0.75)
 
         # Preload VAE
-        if not PROFILING_ENABLED:
-            preload_model(vae, device, is_vae=True)
-        else:
-            preload_start = time.time()
-            preload_model(vae, device, is_vae=True)
-            logging.debug(f"VAE preload took {time.time() - preload_start:.3f} s")
-            logging.debug(f"Post-preload checkpoint: {time.time()}")
+        preload_model(vae, device, is_vae=True)
 
         # Transfer latents with appropriate memory format
         with profile_section("VAE latent transfer"):
@@ -487,31 +532,26 @@ def fast_vae_tiled_decode(vae, samples, tile_size=512, overlap=64, temporal_size
         if PROFILING_ENABLED:
             logging.debug(f"Starting tiled VAE decoding")
             logging.debug(f"Pre-decode checkpoint: {time.time()}")
+        # Adjust tile parameters
+        spacial_compression = getattr(vae, 'spacial_compression_decode', lambda: 8)()
+        tile_size = max(64, (tile_size // spacial_compression) * spacial_compression)
+        overlap = min(tile_size // 4, (overlap // spacial_compression) * spacial_compression)
+        temporal_compression = getattr(vae, 'temporal_compression_decode', lambda: None)()
+        if temporal_compression is not None:
+            temporal_size = max(2, (temporal_size // temporal_compression) * temporal_compression)
+            temporal_overlap = max(1, min(temporal_size // 2, (temporal_overlap // temporal_compression) * temporal_compression))
+        else:
+            temporal_size = None
+            temporal_overlap = None
+        if PROFILING_ENABLED:
+            logging.debug(f"Adjusted tile parameters: tile_size={tile_size}, overlap={overlap}, spacial_compression={spacial_compression}, temporal_size={temporal_size}, temporal_overlap={temporal_overlap}")
 
+        # Perform tiled decoding
         with torch.no_grad():
-            use_amp = is_gpu and is_fp16_safe(device)
+            use_amp = is_gpu and is_fp16_safe(device) and precision in ["fp16", "auto"]
             with autocast(device_type='cuda', enabled=use_amp, dtype=torch.float16 if use_amp else torch.float32):
                 if PROFILING_ENABLED:
-                    logging.debug(f"Tiled VAE decoding with tile_size={tile_size}, overlap={overlap}, "
-                                  f"temporal_size={temporal_size}, temporal_overlap={temporal_overlap}, use_amp={use_amp}, dtype={'torch.float16' if use_amp else 'torch.float32'}")
-
-                # Adjust tile parameters
-                if tile_size < overlap * 4:
-                    overlap = tile_size // 4
-                if temporal_size < temporal_overlap * 2:
-                    temporal_overlap = temporal_overlap // 2
-
-                temporal_compression = getattr(vae, 'temporal_compression_decode', lambda: None)()
-                spacial_compression = getattr(vae, 'spacial_compression_decode', lambda: 8)()
-
-                if temporal_compression is not None:
-                    temporal_size = max(2, temporal_size // temporal_compression)
-                    temporal_overlap = max(1, min(temporal_size // 2, temporal_overlap // temporal_compression))
-                else:
-                    temporal_size = None
-                    temporal_overlap = None
-
-                # Perform tiled decoding
+                    logging.debug(f"Tiled VAE decoding with tile_size={tile_size}, overlap={overlap}, temporal_size={temporal_size}, temporal_overlap={temporal_overlap}, use_amp={use_amp}")
                 decode_start = time.time()
                 images = vae.decode_tiled(
                     latent_samples,
@@ -520,10 +560,9 @@ def fast_vae_tiled_decode(vae, samples, tile_size=512, overlap=64, temporal_size
                     overlap=overlap // spacial_compression,
                     tile_t=temporal_size,
                     overlap_t=temporal_overlap
-                )
+                ).clamp(0, 1)
                 if PROFILING_ENABLED:
                     logging.debug(f"VAE tiled decode took {time.time() - decode_start:.3f} s")
-
                 images = finalize_images(images, device)
 
         if is_gpu and PROFILING_ENABLED:
@@ -543,8 +582,9 @@ def fast_vae_tiled_decode(vae, samples, tile_size=512, overlap=64, temporal_size
         logging.error(f"VAE tiled decode failed: {e}\n{traceback.format_exc()}")
         raise
     finally:
+        if is_gpu:
+            torch.cuda.empty_cache()
         if PROFILING_ENABLED:
             finally_start = time.time()
-        if PROFILING_ENABLED:
             logging.debug(f"Final cleanup took {time.time() - finally_start:.3f} s")
             logging.debug(f"Post-final cleanup checkpoint: {time.time()}")
