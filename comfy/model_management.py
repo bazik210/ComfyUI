@@ -28,8 +28,6 @@ from enum import Enum
 from comfy.cli_args import args, PerformanceFeature
 from comfy.ldm.models.autoencoder import AutoencoderKL
 
-_directml_active_memory_cache = {}
-
 try:
     import torch_directml
     _torch_directml_available = True
@@ -884,9 +882,9 @@ class LoadedModel:
             if precise:
                 memory = module_size(self.model, use_scaling=True)
             else:
-                if hasattr(self.model, 'loaded_size'):
-                    memory = self.model.loaded_size()
-                else:
+            if hasattr(self.model, 'loaded_size'):
+                memory = self.model.loaded_size()
+            else:
                     memory = module_size(self.model, use_scaling=False)
         except Exception as e:
             logging.warning(f"Error when calculating memory model: {e}")
@@ -1556,7 +1554,7 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
 	                        f"Insufficient VRAM for model load: needed={mem_needed / 1024**3:.2f} GB, "
 	                        f"free={mem_free / 1024**3:.2f} GB, tensor_size={tensor_size / 1024**3:.2f} GB")
                     free_memory(mem_needed + minimum_memory_required + tensor_size, device, keep_loaded=loaded)
-                    mem_free = get_cached_memory(device)
+                        mem_free = get_cached_memory(device)
                     if DEBUG_ENABLED:
                         logging.debug(f"After free_memory: free={mem_free / 1024**3:.2f} GB")
                 
@@ -1649,10 +1647,17 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
         return False
     if is_amd():
         try:
-            arch = torch.cuda.get_device_properties(device).gcnArchName
+            props = torch.cuda.get_device_properties(device)
+            # Check if gcnArchName exists; if not, assume FP16 is safe for modern AMD GPUs
+            if hasattr(props, 'gcnArchName'):
+                arch = props.gcnArchName
             if any(a in arch for a in ["gfx1030", "gfx1031", "gfx1010", "gfx1011", "gfx1012", "gfx906", "gfx900", "gfx803"]):
                 return manual_cast
             return True
+            else:
+                # Fallback: Assume FP16 is supported for AMD GPUs unless explicitly disabled
+                logging.warning("gcnArchName not available for AMD GPU. Assuming FP16 support for modern AMD GPUs (RDNA 2 or later).")
+                return True  # Radeon RX 6800 (gfx1030) supports FP16
         except AssertionError:
             # Fallback for non-CUDA AMD GPUs (e.g., via DirectML)
             if DEBUG_ENABLED:
@@ -1692,8 +1697,15 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
     if is_nvidia():
         return props.major >= 8 and supports_cast(torch.bfloat16, device)
     elif is_amd():
+        try:
         arch = props.gcnArchName
+            if not arch:  # If gcnArchName empty or None
+                logging.warning("gcnArchName not available, assuming no BF16 support for AMD GPU")
+                return False
         return any(a in arch for a in ["gfx941", "gfx942"]) and supports_cast(torch.bfloat16, device)
+        except AttributeError:
+            logging.warning("gcnArchName attribute not found, assuming no BF16 support for AMD GPU")
+            return False  # By default disabling BF16 for AMD
     return False
 
 def vae_dtype(device=None, model=None):
