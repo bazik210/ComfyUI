@@ -28,8 +28,6 @@ from enum import Enum
 from comfy.cli_args import args, PerformanceFeature
 from comfy.ldm.models.autoencoder import AutoencoderKL
 
-_directml_active_memory_cache = {}
-
 try:
     import torch_directml
     _torch_directml_available = True
